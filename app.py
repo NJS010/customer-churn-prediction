@@ -18,26 +18,22 @@ FEATURE_PATHS = [
     BASE_DIR / "model_featues.pkl",
 ]
 
-# Load model and feature names
 model = joblib.load(MODEL_PATH)
-
 feature_path = next((p for p in FEATURE_PATHS if p.is_file()), None)
+
 if feature_path is None:
     raise FileNotFoundError("Model feature file not found.")
 
 saved_features = joblib.load(feature_path)
-
-if hasattr(model, "feature_names_in_"):
-    model_features = list(model.feature_names_in_)
-elif isinstance(saved_features, pd.DataFrame):
-    model_features = saved_features.columns.tolist()
-else:
-    model_features = list(saved_features)
-
-app = FastAPI(
-    title="Customer Churn Prediction API",
-    version="2.0.0",
+model_features = (
+    list(model.feature_names_in_)
+    if hasattr(model, "feature_names_in_")
+    else saved_features.columns.tolist()
+    if isinstance(saved_features, pd.DataFrame)
+    else list(saved_features)
 )
+
+app = FastAPI(title="Customer Churn Prediction API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,11 +43,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 def explain_churn(df):
-    """Return the features pushing the prediction toward or away from churn."""
     try:
-        explainer = shap.TreeExplainer(model)
-        values = explainer.shap_values(df)
+        values = shap.TreeExplainer(model).shap_values(df)
 
         if isinstance(values, list):
             values = values[1] if len(values) > 1 else values[0]
@@ -61,14 +56,12 @@ def explain_churn(df):
         values = np.asarray(values)
 
         if values.ndim == 3:
-            class_index = (
-                list(model.classes_).index(1)
-                if 1 in list(model.classes_) else 0
+            class_index = list(model.classes_).index(1)
+            values = (
+                values[0, :, class_index]
+                if values.shape[1] == len(model_features)
+                else values[0, class_index, :]
             )
-            if values.shape[1] == len(model_features):
-                values = values[0, :, class_index]
-            else:
-                values = values[0, class_index, :]
         elif values.ndim == 2:
             values = values[0]
 
@@ -80,32 +73,20 @@ def explain_churn(df):
                 "feature": feature,
                 "value": float(df.iloc[0][feature]),
                 "contribution": round(float(score), 4),
-                "effect": (
-                    "increases churn risk" if score > 0
-                    else "decreases churn risk" if score < 0
-                    else "no effect"
-                ),
+                "effect": "increases churn risk" if score > 0
+                else "decreases churn risk" if score < 0 else "no effect",
             }
             for feature, score in zip(model_features, values)
             if np.isfinite(score)
         ]
 
         contributions.sort(
-            key=lambda item: abs(item["contribution"]),
-            reverse=True,
+            key=lambda item: abs(item["contribution"]), reverse=True
         )
-
-        reasons = [
-            item for item in contributions
-            if item["contribution"] > 0
-        ][:5]
-
-        protective_factors = [
-            item for item in contributions
-            if item["contribution"] < 0
-        ][:5]
-
-        return reasons, protective_factors
+        return (
+            [x for x in contributions if x["contribution"] > 0][:5],
+            [x for x in contributions if x["contribution"] < 0][:5],
+        )
 
     except Exception:
         logger.exception("SHAP explanation failed.")
@@ -114,33 +95,20 @@ def explain_churn(df):
 
 def retention_suggestions(reasons):
     suggestions = {
-        "Contract_Month-to-month":
-            "Offer a suitable longer-term contract option.",
-        "MonthlyCharges":
-            "Review the bill and discuss suitable lower-cost plans.",
-        "tenure":
-            "Consider an onboarding or loyalty offer.",
-        "InternetService_Fiber optic":
-            "Review service quality, pricing, and customer satisfaction.",
-        "PaymentMethod_Electronic check":
-            "Offer convenient alternative payment methods.",
-        "TechSupport_Yes":
-            "Check whether the customer's support issues are resolved.",
-        "OnlineSecurity_Yes":
-            "Review satisfaction with the security service.",
-        "OnlineBackup_Yes":
-            "Review satisfaction with the backup service.",
+        "Contract_Month-to-month": "Offer a suitable longer-term contract.",
+        "MonthlyCharges": "Review the bill and discuss lower-cost plans.",
+        "tenure": "Consider an onboarding or loyalty offer.",
+        "InternetService_Fiber optic": "Review service quality and pricing.",
+        "PaymentMethod_Electronic check": "Offer convenient alternative payment methods.",
+        "TechSupport_Yes": "Check whether the customer's support issues are resolved.",
+        "OnlineSecurity_Yes": "Review satisfaction with the security service.",
+        "OnlineBackup_Yes": "Review satisfaction with the backup service.",
     }
-
-    results = [
-        suggestions[item["feature"]]
-        for item in reasons
-        if item["feature"] in suggestions
-    ]
-
-    return list(dict.fromkeys(results)) or [
-        "Contact the customer to understand their concerns."
-    ]
+    results = list(dict.fromkeys(
+        suggestions[x["feature"]]
+        for x in reasons if x["feature"] in suggestions
+    ))
+    return results or ["Contact the customer to understand their concerns."]
 
 
 @app.get("/")
@@ -158,40 +126,35 @@ def predict_churn(payload: dict = Body(...)):
     customer = payload.get("data", payload)
 
     if not isinstance(customer, dict) or not customer:
+        raise HTTPException(422, "Provide customer feature data.")
+
+    unknown = set(customer) - set(model_features)
+    if unknown:
         raise HTTPException(
-            status_code=422,
-            detail="Provide customer feature data.",
+            422, detail=f"Unknown features: {sorted(unknown)}"
         )
 
-    valid_data = {
-        key: value for key, value in customer.items()
-        if key in model_features
-    }
-
-    if not valid_data:
+    missing = set(model_features) - set(customer)
+    if missing:
         raise HTTPException(
-            status_code=422,
-            detail="No supplied features match the model.",
+            422, detail=f"Missing features: {sorted(missing)}"
         )
-
-    df = pd.DataFrame([valid_data]).reindex(
-        columns=model_features,
-        fill_value=0,
-    )
 
     try:
-        df = df.apply(pd.to_numeric, errors="raise")
+        df = pd.DataFrame(
+            [{feature: customer[feature] for feature in model_features}]
+        ).apply(pd.to_numeric, errors="raise")
     except (ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=422,
-            detail="All features must be numeric and correctly encoded.",
-        ) from exc
+        raise HTTPException(422, "All features must be numeric.") from exc
 
     if not np.isfinite(df.to_numpy(dtype=float)).all():
-        raise HTTPException(
-            status_code=422,
-            detail="Feature values cannot be NaN or infinite.",
-        )
+        raise HTTPException(422, "Feature values cannot be NaN or infinite.")
+
+    if (df["tenure"] < 0).any() or (df["tenure"] > 120).any():
+        raise HTTPException(422, "Tenure must be between 0 and 120 months.")
+
+    if (df["MonthlyCharges"] < 0).any() or (df["TotalCharges"] < 0).any():
+        raise HTTPException(422, "Charges cannot be negative.")
 
     try:
         prediction = int(model.predict(df)[0])
@@ -199,10 +162,7 @@ def predict_churn(payload: dict = Body(...)):
         probabilities = model.predict_proba(df)[0]
 
         if 1 not in classes:
-            raise HTTPException(
-                status_code=500,
-                detail="Churn class 1 not found in model.",
-            )
+            raise HTTPException(500, "Churn class 1 not found in model.")
 
         probability = float(probabilities[classes.index(1)])
         reasons, protective_factors = explain_churn(df)
@@ -210,26 +170,19 @@ def predict_churn(payload: dict = Body(...)):
         return {
             "churn_prediction": prediction,
             "churn_probability": round(probability, 4),
-            "risk_status": (
-                "High Risk" if probability >= 0.5 else "Low Risk"
-            ),
+            "risk_status": "High Risk" if probability >= 0.5 else "Low Risk",
             "top_churn_reasons": reasons if prediction == 1 else [],
             "factors_reducing_churn_risk": protective_factors,
             "retention_suggestions": (
                 retention_suggestions(reasons) if prediction == 1 else []
             ),
             "explanation_note": (
-                "These factors explain the model's prediction; "
-                "they do not prove the customer's actual reasons for leaving."
+                "These factors explain the model's prediction; they do not "
+                "prove the customer's actual reasons for leaving."
             ),
         }
-
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Prediction failed.")
-        raise HTTPException(
-            status_code=500,
-            detail="Prediction failed. Check the API terminal.",
-        ) from exc
-
+        raise HTTPException(500, "Prediction failed. Check the API terminal.") from exc

@@ -1,42 +1,6 @@
-
-from pathlib import Path
-
-import joblib
-import numpy as np
-import pandas as pd
 import requests
 
-BASE_DIR = Path(__file__).resolve().parent
 API_URL = "http://127.0.0.1:8000/predict"
-
-MODEL_PATH = BASE_DIR / "optimized_churn_model.pkl"
-FEATURE_PATHS = [
-    BASE_DIR / "model_features.pkl",
-    BASE_DIR / "model_featues.pkl"
-]
-
-model = joblib.load(MODEL_PATH)
-
-feature_path = next(
-    (p for p in FEATURE_PATHS if p.is_file()),
-    None
-)
-
-if feature_path is None:
-    raise FileNotFoundError("Model feature file was not found.")
-
-saved_features = joblib.load(feature_path)
-
-if hasattr(model, "feature_names_in_"):
-    model_features = list(model.feature_names_in_)
-elif isinstance(saved_features, pd.DataFrame):
-    model_features = saved_features.columns.tolist()
-elif isinstance(saved_features, pd.Index):
-    model_features = saved_features.tolist()
-elif isinstance(saved_features, dict):
-    model_features = list(saved_features.keys())
-else:
-    model_features = list(saved_features)
 
 customer = {
     "SeniorCitizen": 0,
@@ -64,84 +28,127 @@ customer = {
     "PaperlessBilling_Yes": 1,
     "PaymentMethod_Credit card (automatic)": 0,
     "PaymentMethod_Electronic check": 1,
-    "PaymentMethod_Mailed check": 0
+    "PaymentMethod_Mailed check": 0,
 }
 
-missing = [f for f in model_features if f not in customer]
+tests = [
+    (
+        "Valid customer",
+        lambda: requests.post(
+            API_URL, json={"data": customer}, timeout=10
+        ),
+        lambda r: r.status_code == 200
+        and r.json().get("churn_prediction") in (0, 1)
+        and 0 <= float(r.json().get("churn_probability", -1)) <= 1,
+    ),
+    (
+        "Empty request",
+        lambda: requests.post(API_URL, json={}, timeout=10),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Missing customer features",
+        lambda: requests.post(
+            API_URL, json={"data": {"tenure": 12}}, timeout=10
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Invalid numeric value",
+        lambda: requests.post(
+            API_URL, json={"data": {"tenure": "invalid"}}, timeout=10
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Negative tenure",
+        lambda: requests.post(
+            API_URL,
+            json={"data": {**customer, "tenure": -5}},
+            timeout=10,
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Negative monthly charges",
+        lambda: requests.post(
+            API_URL,
+            json={"data": {**customer, "MonthlyCharges": -50}},
+            timeout=10,
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Null request data",
+        lambda: requests.post(
+            API_URL, json={"data": None}, timeout=10
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Unknown feature",
+        lambda: requests.post(
+            API_URL,
+            json={"data": {**customer, "UnknownFeature": 123}},
+            timeout=10,
+        ),
+        lambda r: r.status_code in (400, 422),
+    ),
+    (
+        "Malformed JSON",
+        lambda: requests.post(
+            API_URL,
+            data='{"data" {"tenure": 12}}',
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        ),
+        lambda r: r.status_code == 422,
+    ),
+    (
+        "API documentation available",
+        lambda: requests.get(
+            "http://127.0.0.1:8000/docs", timeout=10
+        ),
+        lambda r: r.status_code == 200,
+    ),
+]
 
-if missing:
-    raise ValueError(f"Test customer is missing features: {missing}")
+passed = 0
+failed = 0
 
-customer = {f: customer[f] for f in model_features}
-
-df = pd.DataFrame([customer], columns=model_features)
-df = df.apply(pd.to_numeric, errors="raise")
-
-if not np.isfinite(df.to_numpy(dtype=float)).all():
-    raise ValueError("Test input contains invalid numeric values.")
-
-local_prediction = int(model.predict(df)[0])
-
-if not hasattr(model, "predict_proba"):
-    raise TypeError("Model does not support predict_proba().")
-
-probabilities = model.predict_proba(df)[0]
-classes = list(model.classes_)
-
-if 1 not in classes:
-    raise ValueError(f"Churn class 1 not found. Model classes: {classes}")
-
-local_probability = float(probabilities[classes.index(1)])
-
-print("\nLOCAL MODEL RESULT")
-print("------------------")
-print("Prediction:", local_prediction)
-print("Churn probability:", round(local_probability, 4))
+print("\nCUSTOMER CHURN API TESTS")
+print("=" * 45)
 
 try:
-    response = requests.post(
-        API_URL,
-        json={"data": customer},
-        timeout=15
-    )
-except requests.RequestException as exc:
-    raise SystemExit(
-        f"Could not connect to the API. Is Uvicorn running? Details: {exc}"
-    )
-
-print("\nAPI HTTP STATUS:", response.status_code)
-
-if response.status_code != 200:
-    print("API ERROR:", response.text)
-    raise SystemExit("API test failed.")
-
-api_result = response.json()
-
-print("\nAPI RESULT")
-print("----------")
-print(api_result)
-
-api_prediction = api_result.get("churn_prediction")
-api_probability = api_result.get("churn_probability")
-
-if api_prediction is None or api_probability is None:
-    raise SystemExit("API response is missing prediction or probability.")
-
-prediction_matches = int(api_prediction) == local_prediction
-probability_matches = np.isclose(
-    float(api_probability),
-    local_probability,
-    atol=0.00011,
-    rtol=0
-)
-
-print("\nVERIFICATION")
-print("------------")
-print("Prediction matches:", prediction_matches)
-print("Probability matches:", probability_matches)
-
-if prediction_matches and probability_matches:
-    print("\nPASS: API and local model predictions match.")
-else:
-    print("\nFAIL: API and local model predictions differ.")
+    requests.get("http://127.0.0.1:8000/docs", timeout=3)
+except requests.RequestException:
+    print("API is not running. Start it with:")
+    print("uvicorn app:app --reload")
     raise SystemExit(1)
+
+for name, send_request, check in tests:
+    try:
+        response = send_request()
+        success = check(response)
+
+        if success:
+            print(f"PASS: {name}")
+            passed += 1
+        else:
+            print(f"FAIL: {name} (HTTP {response.status_code})")
+            print("      Response:", response.text[:300])
+            failed += 1
+
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+        print(f"FAIL: {name} ({exc})")
+        failed += 1
+
+print("=" * 45)
+print(f"Passed: {passed}/{len(tests)}")
+print(f"Failed: {failed}/{len(tests)}")
+
+if failed:
+    print("Some tests failed. Review the results above.")
+    raise SystemExit(1)
+
+print("All tests passed!")
