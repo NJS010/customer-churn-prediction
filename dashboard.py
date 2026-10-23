@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 import plotly.graph_objects as go
@@ -10,7 +9,12 @@ st.set_page_config(
     layout="wide",
 )
 
-API_URL = "http://127.0.0.1:8000/predict"
+import os
+
+API_URL = os.getenv(
+    "API_URL",
+    "http://127.0.0.1:8000/predict"
+)
 
 st.title("📊 Customer Churn Prediction Dashboard")
 st.caption("Predict churn risk and understand the factors influencing it.")

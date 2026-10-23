@@ -1,0 +1,6 @@
+churn_env/
+venv/
+__pycache__/
+.git/
+.env
+.streamlit/secrets.toml
