@@ -1,4 +1,6 @@
 churn_env/
 *.csv
 *.pkl
+!optimized_churn_model.pkl
+!model_featues.pkl
 __pycache__/
